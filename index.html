@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CloudNoteHub — Secure Cloud-Based Note Sharing</title>
+<meta name="description" content="CloudNoteHub: secure, simple, smart cloud note sharing for students and teachers, built on Firebase." />
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background:#F7F8FA; }
+  .skel { background: linear-gradient(90deg,#eee 25%,#f5f5f5 37%,#eee 63%); background-size:400% 100%; animation: sk 1.4s ease infinite; }
+  @keyframes sk { 0%{background-position:100% 50%} 100%{background-position:0 50%} }
+  .toast { animation: slideIn .25s ease-out; }
+  @keyframes slideIn { from{transform:translateY(-8px);opacity:0} to{transform:translateY(0);opacity:1} }
+</style>
+</head>
+<body class="text-slate-800">
+
+<div id="root" class="min-h-screen"></div>
+<div id="toasts" class="fixed top-4 right-4 z-50 flex flex-col gap-2 w-80"></div>
+
+<!-- ============================================================
+  FIREBASE — compat SDK loaded from Google's own CDN (gstatic).
+  This is the standard, supported way to use Firebase from a
+  single plain HTML file (no bundler). For the real Vite/React
+  project we scaffold later, we switch to the modular SDK
+  (firebase/app, firebase/auth, etc.) via npm instead.
+============================================================= -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+<script>
+/* ==========================================================
+   1) FIREBASE CONFIG
+   Replace with YOUR project's values from:
+   Firebase Console → Project settings → Your apps → SDK setup
+   These "web config" values are safe to ship client-side —
+   they are NOT secrets. Real protection comes from Security
+   Rules below, not from hiding this object.
+========================================================== */
+const firebaseConfig = {
+  apiKey: "AIzaSyDxtZOwvZBzkOKXkgl6ZD8c9TppLR75vMM",
+  authDomain: "cloudnotehub.firebaseapp.com",
+  projectId: "cloudnotehub",
+  storageBucket: "cloudnotehub.firebasestorage.app",
+  messagingSenderId: "353515529898",
+  appId: "1:353515529898:web:24de0b52956dee7aba92d3"
+};
+
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+const googleProvider = new firebase.auth.GoogleAuthProvider();
+
+// Firestore documents are capped at 1MB total. Base64 encoding
+// inflates a file by ~33%, so we cap the RAW file at 700KB to
+// stay safely under that limit once encoded + metadata is added.
+const MAX_FILE_BYTES = 700 * 1024;
+
+/* ==========================================================
+   2) APP STATE
+========================================================== */
+let state = {
+  user: null,        // firebase auth user
+  profile: null,      // Firestore users/{uid} doc
+  notes: [],
+  loadingNotes: true,
+  view: "home",       // home | login | register | dashboard | upload
+  authBusy: false,
+};
+
+function setState(patch) {
+  state = { ...state, ...patch };
+  render();
+}
+
+function toast(msg, type = "info") {
+  const el = document.createElement("div");
+  const colors = { info: "bg-slate-800", error: "bg-red-600", success: "bg-emerald-600" };
+  el.className = `toast ${colors[type]} text-white text-sm px-4 py-3 rounded-lg shadow-lg`;
+  el.textContent = msg;
+  document.getElementById("toasts").appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+/* ==========================================================
+   3) AUTH SERVICE
+========================================================== */
+async function ensureUserProfile(user) {
+  const ref = db.collection("users").doc(user.uid);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    // Role defaults to "student" and can ONLY be changed by an
+    // admin-controlled path later — never by the client again.
+    // See firestore.rules: users update rule forbids role/
+    // accountStatus changes from a normal user request.
+    await ref.set({
+      uid: user.uid,
+      name: user.displayName || user.email?.split("@")[0] || "New User",
+      email: user.email || "",
+      photoURL: user.photoURL || "",
+      role: "student",
+      accountStatus: "active",
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+  const fresh = await ref.get();
+  return fresh.data();
+}
+
+async function registerWithEmail(name, email, password) {
+  setState({ authBusy: true });
+  try {
+    const cred = await auth.createUserWithEmailAndPassword(email, password);
+    await cred.user.updateProfile({ displayName: name });
+    await ensureUserProfile(cred.user);
+    toast("Account created. Welcome to CloudNoteHub!", "success");
+  } catch (e) {
+    toast(friendlyAuthError(e), "error");
+  } finally {
+    setState({ authBusy: false });
+  }
+}
+
+async function loginWithEmail(email, password) {
+  setState({ authBusy: true });
+  try {
+    await auth.signInWithEmailAndPassword(email, password);
+    toast("Welcome back!", "success");
+  } catch (e) {
+    toast(friendlyAuthError(e), "error");
+  } finally {
+    setState({ authBusy: false });
+  }
+}
+
+async function loginWithGoogle() {
+  setState({ authBusy: true });
+  try {
+    await auth.signInWithPopup(googleProvider);
+    toast("Signed in with Google", "success");
+  } catch (e) {
+    toast(friendlyAuthError(e), "error");
+  } finally {
+    setState({ authBusy: false });
+  }
+}
+
+async function logout() {
+  await auth.signOut();
+  setState({ view: "home", notes: [] });
+}
+
+function friendlyAuthError(e) {
+  const map = {
+    "auth/user-not-found": "No account found with that email.",
+    "auth/wrong-password": "Incorrect password.",
+    "auth/email-already-in-use": "That email is already registered.",
+    "auth/invalid-email": "That email address looks invalid.",
+    "auth/too-many-requests": "Too many attempts. Try again shortly.",
+    "auth/weak-password": "Password should be at least 6 characters.",
+  };
+  return map[e.code] || "Something went wrong. Please try again.";
+}
+
+auth.onAuthStateChanged(async (user) => {
+  if (user) {
+    try {
+      const profile = await ensureUserProfile(user);
+      setState({ user, profile, view: "dashboard" });
+      subscribeNotes();
+      await maybeLoadSharedNote();
+    } catch (e) {
+      console.error("Failed to load/create user profile:", e);
+      toast("Signed in, but couldn't load your profile: " + (e.code || e.message) + ". Check Firestore rules are deployed.", "error");
+      // Still show something rather than freezing on the login screen forever.
+      setState({ user, profile: { name: user.displayName || user.email, role: "student", accountStatus: "unknown" }, view: "dashboard" });
+    }
+  } else {
+    setState({ user: null, profile: null, view: "home", notes: [] });
+  }
+});
+
+/* ==========================================================
+   4) NOTES SERVICE — NoSQL-only version.
+   Files are stored as Base64 strings directly inside the
+   Firestore "notes" document (field: fileData). There is no
+   Cloud Storage bucket involved, so this needs no Blaze plan.
+   Trade-off: Firestore caps a document at 1MB total, so raw
+   files are capped at MAX_FILE_BYTES (~700KB) to leave room
+   for Base64's ~33% size inflation plus the other fields.
+========================================================== */
+let unsubscribeNotes = null;
+
+function subscribeNotes() {
+  if (unsubscribeNotes) unsubscribeNotes();
+  setState({ loadingNotes: true });
+  // Approved notes are public; actual enforcement of "who can
+  // read what" happens in firestore.rules — this query just
+  // shapes the UI. We deliberately do NOT select fileData here
+  // for the list view (see note below) to keep list reads cheap.
+  unsubscribeNotes = db.collection("notes")
+    .orderBy("createdAt", "desc")
+    .limit(50)
+    .onSnapshot(
+      (qs) => {
+        const notes = qs.docs.map((d) => ({ id: d.id, ...d.data() }));
+        setState({ notes, loadingNotes: false });
+      },
+      (err) => {
+        console.error(err);
+        setState({ loadingNotes: false });
+        toast("Could not load notes (check Firestore rules).", "error");
+      }
+    );
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result); // data:<mime>;base64,AAAA...
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadNote({ title, description, subject, file }, onProgress) {
+  if (!state.user) return toast("Please sign in first.", "error");
+  if (!file) return toast("Please choose a file.", "error");
+
+  if (file.size > MAX_FILE_BYTES) {
+    const limitKB = Math.round(MAX_FILE_BYTES / 1024);
+    return toast(`File is too large for NoSQL storage. Max ~${limitKB}KB (Firestore's 1MB document limit). Try a smaller or compressed file.`, "error");
+  }
+  const allowed = ["application/pdf", "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "text/plain", "image/png", "image/jpeg"];
+  if (!allowed.includes(file.type)) {
+    return toast("Unsupported file type.", "error");
+  }
+
+  try {
+    onProgress(20);
+    const base64 = await fileToBase64(file);
+    onProgress(60);
+
+    const noteRef = db.collection("notes").doc();
+    await noteRef.set({
+      id: noteRef.id,
+      title, description, subject,
+      fileName: file.name,
+      fileData: base64,      // the file itself, lives right in the document
+      fileSize: file.size,
+      fileType: file.type,
+      uploadedBy: state.user.uid,
+      uploaderName: state.profile.name,
+      uploaderRole: state.profile.role,
+      status: "approved", // demo default; admin flow can flip to "pending"
+      downloadCount: 0,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    onProgress(100);
+    toast("Note uploaded successfully!", "success");
+    setState({ view: "dashboard" });
+  } catch (e) {
+    console.error(e);
+    toast("Upload failed: " + (e.code || e.message), "error");
+  }
+}
+
+async function downloadNote(note) {
+  await db.collection("notes").doc(note.id).update({
+    downloadCount: firebase.firestore.FieldValue.increment(1),
+  });
+  // note.fileData is a data: URL (data:<mime>;base64,....).
+  // Trigger a real browser download using it directly.
+  const a = document.createElement("a");
+  a.href = note.fileData;
+  a.download = note.fileName || note.title;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/* ==========================================================
+   4b) SHARING — no Storage means no public file URL, so we
+   share the Firestore document ID as a link. Opening the link
+   fetches that single note straight from Firestore.
+========================================================== */
+async function copyShareLink(note) {
+  const url = `${location.origin}${location.pathname}?note=${note.id}`;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast("Share link copied to clipboard!", "success");
+  } catch {
+    prompt("Copy this share link:", url);
+  }
+}
+
+async function maybeLoadSharedNote() {
+  const params = new URLSearchParams(location.search);
+  const noteId = params.get("note");
+  if (!noteId) return;
+  try {
+    const snap = await db.collection("notes").doc(noteId).get();
+    if (snap.exists) {
+      toast(`Shared note "${snap.data().title}" loaded — see it in your notes list.`, "success");
+    } else {
+      toast("That shared note no longer exists.", "error");
+    }
+  } catch (e) {
+    toast("Couldn't open shared note (permission or not found).", "error");
+  }
+}
+
+async function deleteNote(note) {
+  if (!confirm(`Delete "${note.title}"?`)) return;
+  await db.collection("notes").doc(note.id).delete();
+  toast("Note deleted.", "success");
+}
+
+/* ==========================================================
+   5) UI — tiny render-function-based renderer (no framework,
+   since this is a single dependency-free file). The real
+   project uses React components per src/components.
+========================================================== */
+function icon(name, cls = "w-5 h-5") {
+  const paths = {
+    upload: '<path d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14" stroke-linecap="round" stroke-linejoin="round"/>',
+    file: '<path d="M6 2h9l5 5v15H6V2z" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 2v6h6" stroke-linecap="round" stroke-linejoin="round"/>',
+    download: '<path d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14" stroke-linecap="round" stroke-linejoin="round" transform="rotate(180 12 12)"/>',
+    trash: '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6h16z" stroke-linecap="round" stroke-linejoin="round"/>',
+    shield: '<path d="M12 2 4 5v6c0 5 3.5 9 8 11 4.5-2 8-6 8-11V5l-8-3z" stroke-linecap="round" stroke-linejoin="round"/>',
+    logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" stroke-linecap="round" stroke-linejoin="round"/>',
+    share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5 15.4 17.5M15.4 6.5 8.6 10.5" stroke-linecap="round"/>',
+  };
+  return `<svg xmlns="http://www.w3.org/2000/svg" class="${cls}" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">${paths[name] || ""}</svg>`;
+}
+
+function Header() {
+  return `
+  <header class="border-b border-slate-200 bg-white sticky top-0 z-40">
+    <div class="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+      <button onclick="setState({view:'home'})" class="flex items-center gap-2 font-semibold text-lg text-slate-900">
+        <span class="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center text-sm">CN</span>
+        CloudNoteHub
+      </button>
+      ${state.user ? `
+        <div class="flex items-center gap-3">
+          <span class="text-sm text-slate-500 hidden sm:inline">${state.profile?.role || ""}</span>
+          <button onclick="setState({view:'dashboard'})" class="text-sm px-3 py-1.5 rounded-md hover:bg-slate-100">Dashboard</button>
+          <button onclick="setState({view:'upload'})" class="text-sm px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 flex items-center gap-1">${icon('upload','w-4 h-4')} Upload</button>
+          <button onclick="logout()" title="Log out" class="p-2 rounded-md hover:bg-slate-100 text-slate-500">${icon('logout')}</button>
+        </div>` : `
+        <div class="flex items-center gap-2">
+          <button onclick="setState({view:'login'})" class="text-sm px-3 py-1.5 rounded-md hover:bg-slate-100">Log in</button>
+          <button onclick="setState({view:'register'})" class="text-sm px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Sign up</button>
+        </div>`}
+    </div>
+  </header>`;
+}
+
+function Home() {
+  return `
+  <section class="max-w-3xl mx-auto text-center px-4 pt-20 pb-16">
+    <div class="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 px-3 py-1 rounded-full mb-5">${icon('shield','w-3.5 h-3.5')} Secured by Firebase</div>
+    <h1 class="text-4xl sm:text-5xl font-semibold tracking-tight text-slate-900">Secure. Simple. Smart note sharing.</h1>
+    <p class="mt-4 text-slate-600 text-lg">Upload, discover, and share study material across your class — protected by real cloud authentication and role-based access.</p>
+    <div class="mt-8 flex justify-center gap-3">
+      <button onclick="setState({view:'register'})" class="px-5 py-2.5 rounded-lg bg-indigo-600 text-white font-medium hover:bg-indigo-700">Get started free</button>
+      <button onclick="document.getElementById('notes-preview').scrollIntoView({behavior:'smooth'})" class="px-5 py-2.5 rounded-lg border border-slate-300 font-medium hover:bg-slate-50">Browse notes</button>
+    </div>
+  </section>
+  <section id="notes-preview" class="max-w-6xl mx-auto px-4 pb-24">
+    <h2 class="text-lg font-semibold mb-4">Latest notes</h2>
+    ${NotesGrid(state.notes.slice(0, 6))}
+  </section>`;
+}
+
+function AuthForm(mode) {
+  const isRegister = mode === "register";
+  return `
+  <section class="max-w-sm mx-auto px-4 py-16">
+    <h1 class="text-2xl font-semibold text-center mb-1">${isRegister ? "Create your account" : "Welcome back"}</h1>
+    <p class="text-center text-slate-500 text-sm mb-6">${isRegister ? "Join CloudNoteHub in seconds" : "Log in to CloudNoteHub"}</p>
+    <form id="auth-form" class="space-y-3" onsubmit="return handleAuthSubmit(event, ${isRegister})">
+      ${isRegister ? `<input name="name" required placeholder="Full name" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />` : ""}
+      <input name="email" type="email" required placeholder="Email address" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+      <input name="password" type="password" required minlength="6" placeholder="Password" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+      <button ${state.authBusy ? "disabled" : ""} class="w-full py-2.5 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 disabled:opacity-60">
+        ${state.authBusy ? "Please wait…" : isRegister ? "Create account" : "Log in"}
+      </button>
+    </form>
+    <div class="flex items-center gap-3 my-4 text-xs text-slate-400"><div class="flex-1 h-px bg-slate-200"></div>or<div class="flex-1 h-px bg-slate-200"></div></div>
+    <button onclick="loginWithGoogle()" class="w-full py-2.5 rounded-lg border border-slate-300 text-sm font-medium hover:bg-slate-50">Continue with Google</button>
+    <p class="text-center text-sm text-slate-500 mt-6">
+      ${isRegister ? "Already have an account?" : "New here?"}
+      <button onclick="setState({view:'${isRegister ? "login" : "register"}'})" class="text-indigo-600 font-medium">${isRegister ? "Log in" : "Sign up"}</button>
+    </p>
+  </section>`;
+}
+
+function handleAuthSubmit(e, isRegister) {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  if (isRegister) registerWithEmail(f.get("name"), f.get("email"), f.get("password"));
+  else loginWithEmail(f.get("email"), f.get("password"));
+  return false;
+}
+
+function StatCard(label, value) {
+  return `<div class="bg-white rounded-xl border border-slate-200 p-4">
+    <p class="text-xs text-slate-500">${label}</p>
+    <p class="text-2xl font-semibold mt-1">${value}</p>
+  </div>`;
+}
+
+function Dashboard() {
+  const mine = state.notes.filter(n => n.uploadedBy === state.user?.uid);
+  const totalDownloads = mine.reduce((s, n) => s + (n.downloadCount || 0), 0);
+  return `
+  <section class="max-w-6xl mx-auto px-4 py-10">
+    <h1 class="text-2xl font-semibold mb-1">Hi, ${state.profile?.name || "there"} 👋</h1>
+    <p class="text-slate-500 text-sm mb-6">Role: <span class="font-medium capitalize">${state.profile?.role}</span></p>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
+      ${StatCard("Total notes", state.notes.length)}
+      ${StatCard("My uploads", mine.length)}
+      ${StatCard("My downloads received", totalDownloads)}
+      ${StatCard("Account status", state.profile?.accountStatus || "-")}
+    </div>
+    <h2 class="text-lg font-semibold mb-4">All notes</h2>
+    ${NotesGrid(state.notes)}
+  </section>`;
+}
+
+function NotesGrid(notes) {
+  if (state.loadingNotes) {
+    return `<div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">${Array(3).fill(0).map(()=>`<div class="h-32 rounded-xl skel"></div>`).join("")}</div>`;
+  }
+  if (!notes.length) {
+    return `<div class="text-center py-16 text-slate-400 border border-dashed border-slate-300 rounded-xl">
+      No notes yet. Be the first to <button onclick="setState({view:'upload'})" class="text-indigo-600 font-medium">upload one</button>.
+    </div>`;
+  }
+  return `<div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+    ${notes.map(n => `
+      <div class="bg-white rounded-xl border border-slate-200 p-4 flex flex-col">
+        <div class="flex items-start gap-2 mb-2">
+          <span class="text-indigo-600 mt-0.5">${icon('file','w-5 h-5')}</span>
+          <div>
+            <p class="font-medium text-sm leading-tight">${escapeHtml(n.title)}</p>
+            <p class="text-xs text-slate-400">${escapeHtml(n.subject || "General")} • ${escapeHtml(n.uploaderName || "")}</p>
+          </div>
+        </div>
+        <p class="text-xs text-slate-500 flex-1 line-clamp-2">${escapeHtml(n.description || "")}</p>
+        <div class="flex items-center justify-between mt-3 pt-3 border-t border-slate-100">
+          <span class="text-xs text-slate-400">${n.downloadCount || 0} downloads</span>
+          <div class="flex gap-1">
+            <button onclick='copyShareLink(${JSON.stringify({id:n.id,title:n.title}).replace(/'/g,"&apos;")})' title="Copy share link" class="p-1.5 rounded-md hover:bg-slate-100 text-slate-600">${icon('share','w-4 h-4')}</button>
+            <button onclick='downloadNote(${JSON.stringify(n).replace(/'/g,"&apos;")})' title="Download" class="p-1.5 rounded-md hover:bg-slate-100 text-slate-600">${icon('download','w-4 h-4')}</button>
+            ${state.user && (n.uploadedBy === state.user.uid || state.profile?.role === "admin") ? `
+            <button onclick='deleteNote(${JSON.stringify(n).replace(/'/g,"&apos;")})' title="Delete" class="p-1.5 rounded-md hover:bg-red-50 text-red-500">${icon('trash','w-4 h-4')}</button>` : ""}
+          </div>
+        </div>
+      </div>
+    `).join("")}
+  </div>`;
+}
+
+function UploadView() {
+  return `
+  <section class="max-w-lg mx-auto px-4 py-12">
+    <h1 class="text-2xl font-semibold mb-6">Upload a note</h1>
+    <form id="upload-form" class="space-y-3" onsubmit="return handleUploadSubmit(event)">
+      <input name="title" required placeholder="Title" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" />
+      <textarea name="description" placeholder="Description" rows="3" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm"></textarea>
+      <input name="subject" required placeholder="Subject (e.g. Data Structures)" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" />
+      <input name="file" type="file" required accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.png,.jpg,.jpeg" class="w-full text-sm" />
+      <p class="text-xs text-amber-600 bg-amber-50 rounded-md px-2 py-1.5">Stored directly in Firestore (no billing needed) — max ~700KB per file, since Firestore documents are capped at 1MB.</p>
+      <div id="progress-wrap" class="hidden">
+        <div class="h-2 bg-slate-100 rounded-full overflow-hidden"><div id="progress-bar" class="h-full bg-indigo-600 w-0 transition-all"></div></div>
+      </div>
+      <button class="w-full py-2.5 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700">Upload note</button>
+    </form>
+  </section>`;
+}
+
+function handleUploadSubmit(e) {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const file = f.get("file");
+  document.getElementById("progress-wrap").classList.remove("hidden");
+  uploadNote(
+    { title: f.get("title"), description: f.get("description"), subject: f.get("subject"), file },
+    (pct) => { document.getElementById("progress-bar").style.width = pct + "%"; }
+  );
+  return false;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function render() {
+  const root = document.getElementById("root");
+  let body = "";
+  if (state.view === "login") body = AuthForm("login");
+  else if (state.view === "register") body = AuthForm("register");
+  else if (state.view === "dashboard" && state.user) body = Dashboard();
+  else if (state.view === "upload" && state.user) body = UploadView();
+  else body = Home();
+  root.innerHTML = Header() + body;
+}
+
+render();
+</script>
+</body>
+</html>
